@@ -1,0 +1,11 @@
+[package]
+name = "quiche-future"
+version = "0.1.0"
+authors = ["Jun Ryoung Ju <junryoungju@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+quiche = "*"
+async-std = { version = "*", features = ["unstable"] }
+anyhow = "*"
+futures = "*"
