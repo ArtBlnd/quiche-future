@@ -16,11 +16,11 @@ pub struct QuicClient {
 }
 
 impl QuicClient {
-    pub async fn wait_stream(&mut self) -> QuicStream {
+    pub async fn listen_stream(&mut self) -> QuicStream {
         self.incoming.recv().await.unwrap()
     }
     
-    pub async fn make_stream(&mut self, strm_id: u64) -> QuicStream {
+    pub async fn create_stream(&mut self, strm_id: u64) -> QuicStream {
         let (rx_sink, rx_strm) = sync::channel::<IoRecvOps>(256);
         self.tx.send(IoSendOps::IoStreamOpen(strm_id, rx_sink)).await;
 
