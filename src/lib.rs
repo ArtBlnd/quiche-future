@@ -1,17 +1,16 @@
-use std::net::SocketAddr;
+mod client;
+mod server;
+
 use std::pin::Pin;
 use std::task::{ Poll, Context, Waker};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{HashSet};
+use std::sync::{Mutex};
 use std::io::Error;
 use std::io::ErrorKind;
-use std::marker::PhantomData;
 
-use anyhow;
 use async_std::*;
-use quiche;
-use futures::{ select, ready, pin_mut};
-use futures::{ FutureExt, AsyncReadExt, AsyncWriteExt };
+use futures::{ ready, pin_mut};
+use futures::FutureExt;
 
 #[derive(Default)]
 pub struct ClientConfig {
@@ -39,38 +38,27 @@ pub struct ServerConfig {
 
 }
 
-pub enum IoNotifyType {
-    
-}
+pub type IoSendStream = sync::Receiver<IoSendOps>;
+pub type IoSendSink = sync::Sender<IoSendOps>;
+pub type IoRecvStream = sync::Receiver<IoRecvOps>;
+pub type IoRecvSink = sync::Sender<IoRecvOps>;
 
 pub enum IoSendOps {
-    IoSend(Vec<u8>, Waker),
-    IoFlush(Waker),
-    IoClose(Waker),
+    IoSend(u64, Vec<u8>, Waker),
+    IoFlush(u64, Waker),
+    IoClose(u64, Waker),
+    IoStreamOpen(u64, IoRecvSink)
 }
 
 pub enum IoRecvOps {
-    IoRecv(Vec<u8>)
+    IoRecv(Vec<u8>),
+    IoEof()
 }
-
-type IoSendStream = sync::Sender<IoSendOps>;
-type IoRecvStream = sync::Receiver<IoRecvOps>;
 
 pub enum StreamOps {
     StreamOpen(u64),
     StreamOpened(u64, QuicStream),
     StreamClose(u64),
-}
-
-pub struct QuicConnection {
-    incoming: sync::Receiver<QuicStream>,
-    tx: sync::Sender<Vec<u8>>
-}
-
-impl QuicConnection {
-    pub async fn wait_stream(&mut self) -> QuicStream {
-        self.incoming.recv().await.unwrap()
-    }
 }
 
 unsafe impl Sync for QuicStream { }
@@ -83,7 +71,7 @@ pub struct QuicStream {
     local_storage: Option<Vec<u8>>,
 
     tx_pending: Mutex<HashSet<usize>>,
-    tx: IoSendStream,
+    tx: IoSendSink,
     rx: IoRecvStream,
 }
 
@@ -113,14 +101,13 @@ impl futures::AsyncRead for QuicStream {
             Ok (v) => {
                 match v {
                     IoRecvOps::IoRecv(buf) => {
-                        // Check its EOF
-                        if buf.len() == 0 {
-                            return Poll::Ready(Ok(0));
-                        }
-
                         // We have buffer to read
                         self_mut.local_storage = Some(buf);
                         cx.waker().wake_by_ref();
+                    }
+
+                    IoRecvOps::IoEof() => {
+                        return Poll::Ready(Ok(0));
                     }
                 };
             },
@@ -149,7 +136,7 @@ impl futures::AsyncWrite for QuicStream {
             let mut buf = Vec::new();
             buf.extend_from_slice(&rbuf);
 
-            self_mut.tx.send(IoSendOps::IoSend(buf, cx.waker().clone())).await;
+            self_mut.tx.send(IoSendOps::IoSend(0, buf, cx.waker().clone())).await;
         });
 
         return Poll::Pending;
@@ -164,7 +151,7 @@ impl futures::AsyncWrite for QuicStream {
         }
         
         task::block_on( async { 
-            self_mut.tx.send(IoSendOps::IoClose(cx.waker().clone())).await;
+            self_mut.tx.send(IoSendOps::IoClose(0, cx.waker().clone())).await;
             self_mut.recv_flush = true;
         });
 
@@ -179,73 +166,10 @@ impl futures::AsyncWrite for QuicStream {
         }
 
         task::block_on( async { 
-            self_mut.tx.send(IoSendOps::IoClose(cx.waker().clone())).await;
+            self_mut.tx.send(IoSendOps::IoClose(0, cx.waker().clone())).await;
             self_mut.recv_close = true;
         });
 
         return Poll::Pending;
     }
-}
-
-pub async fn connect(addr: SocketAddr, conf: ClientConfig) -> Result<QuicConnection, anyhow::Error> {
-    let mut quic_conn = task::spawn_blocking(move || {
-        let mut quic_conf = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-        quic_conf.verify_peer(conf.ssl_verify);
-        quic_conf.set_initial_max_data(conf.pl_init_max_sz as u64);
-        quic_conf.set_initial_max_stream_data_bidi_local(conf.pl_init_max_bidi_sz as u64);
-        quic_conf.set_initial_max_stream_data_bidi_remote(conf.pl_init_max_bidi_sz as u64);
-        quic_conf.set_initial_max_streams_bidi(conf.pl_max_bidi_streams as u64);
-        quic_conf.set_initial_max_stream_data_uni(conf.pl_init_max_uni_sz as u64);
-        quic_conf.set_max_idle_timeout(conf.conn_timeout as u64);
-        quic_conf.set_max_packet_size(conf.conn_max_udp_size as u64);
-
-        Ok::<Pin<Box<quiche::Connection>>, anyhow::Error>(
-            quiche::connect(conf.ssl_sni.as_deref(), &conf.conn_scid, &mut quic_conf)?
-        )
-    }).await?;
-
-    let (conn_tx, conn_rx) = sync::channel::<QuicStream>(128);
-    let (send_tx, send_rx) = sync::channel::<Vec<u8>>(128);
-
-    task::spawn(async move {
-        let socket = net::UdpSocket::bind(addr).await.expect("failed to bind socket!");
-        
-        // keep communication with server to establish.
-        while quic_conn.is_established() {
-            let mut buf = [0u8; 4096];
-
-            loop {
-                match quic_conn.send(&mut buf) {
-                    Ok (v)                   => socket.send(&buf).await.unwrap(),
-                    Err(quiche::Error::Done) => break,
-                    Err(_)                   => unreachable!(),
-                };
-            }
-
-            match socket.recv(&mut buf).await {
-                Ok (v) => quic_conn.recv(&mut buf[0..v]).expect("failed to process buffer!"),
-                Err(_) => unreachable!()
-            };
-        }
-
-        // Seems connection has been established.
-        loop {
-            let mut tmp_buf = [0u8; 4096];
-            select! {
-                // process send io ops
-                req = async { send_rx.recv().await.unwrap() }.fuse()
-                    => {
-                        
-                    }
-
-                // process recv io ops
-                req = socket.recv(&mut tmp_buf).fuse()
-                    => {
-                        quic_conn.recv(&mut tmp_buf).unwrap();
-                    }
-            }
-        }
-    });
-
-    Ok(QuicConnection {incoming: conn_rx, tx: send_tx})
 }
