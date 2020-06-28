@@ -65,6 +65,8 @@ unsafe impl Sync for QuicStream { }
 unsafe impl Send for QuicStream { }
 
 pub struct QuicStream {
+    stream_id: u64,
+
     recv_close: bool,
     recv_flush: bool,
 
@@ -73,6 +75,12 @@ pub struct QuicStream {
     tx_pending: Mutex<HashSet<usize>>,
     tx: IoSendSink,
     rx: IoRecvStream,
+}
+
+impl QuicStream { 
+    pub fn stream_id(&self) -> u64 {
+        return self.stream_id;
+    }
 }
 
 impl futures::AsyncRead for QuicStream {
@@ -136,7 +144,7 @@ impl futures::AsyncWrite for QuicStream {
             let mut buf = Vec::new();
             buf.extend_from_slice(&rbuf);
 
-            self_mut.tx.send(IoSendOps::IoSend(0, buf, cx.waker().clone())).await;
+            self_mut.tx.send(IoSendOps::IoSend(self_mut.stream_id, buf, cx.waker().clone())).await;
         });
 
         return Poll::Pending;
@@ -151,7 +159,7 @@ impl futures::AsyncWrite for QuicStream {
         }
         
         task::block_on( async { 
-            self_mut.tx.send(IoSendOps::IoClose(0, cx.waker().clone())).await;
+            self_mut.tx.send(IoSendOps::IoClose(self_mut.stream_id, cx.waker().clone())).await;
             self_mut.recv_flush = true;
         });
 
@@ -166,7 +174,7 @@ impl futures::AsyncWrite for QuicStream {
         }
 
         task::block_on( async { 
-            self_mut.tx.send(IoSendOps::IoClose(0, cx.waker().clone())).await;
+            self_mut.tx.send(IoSendOps::IoClose(self_mut.stream_id, cx.waker().clone())).await;
             self_mut.recv_close = true;
         });
 

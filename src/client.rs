@@ -25,6 +25,7 @@ impl QuicClient {
         self.tx.send(IoSendOps::IoStreamOpen(strm_id, rx_sink)).await;
 
         return QuicStream { 
+            stream_id: strm_id,
             recv_close: false,
             recv_flush: false,
             local_storage: None,
@@ -121,7 +122,8 @@ async fn client_dispatch_recv(internal: &mut QuicClientInternal, buf: &mut [u8])
         if !internal.strm_table.contains_key(&strm_id) {
             let (rx_sink, rx_strm) = sync::channel::<IoRecvOps>(256);
 
-            internal.strm_tx.send(QuicStream { 
+            internal.strm_tx.send(QuicStream {
+                stream_id: strm_id,
                 recv_close: false,
                 recv_flush: false,
                 local_storage: None,
