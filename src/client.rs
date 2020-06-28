@@ -1,5 +1,3 @@
-#![feature(async_await)]
-
 use crate::*;
 
 use std::net::SocketAddr;
@@ -10,7 +8,7 @@ use anyhow;
 use async_std::*;
 use quiche;
 use futures::select;
-use futures::join;
+use log;
 
 pub struct QuicClient {
     incoming: sync::Receiver<QuicStream>,
@@ -74,15 +72,18 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
     let wk;
 
     match req { 
-        IoSendOps::IoFlush(strm_id, waker) => { 
+        IoSendOps::IoFlush(strm_id, waker) => {
             wk = waker; 
         }
         IoSendOps::IoClose(strm_id, waker) => { 
             wk = waker;
             internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
+
+            log::info!("id = {} : stream closed", strm_id);
         }
 
         IoSendOps::IoSend(strm_id, buf, waker) => {
+            
             wk = waker;
 
             let mut tmp_buf = [0u8; 4096];
@@ -91,6 +92,8 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
             while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
                 internal.sock_conn.send(&tmp_buf[0..sz]).await;
             }
+
+            log::info!("id = {} : sent {} bytes", strm_id, buf.len());
         }
 
         IoSendOps::IoStreamOpen(strm_id, sink) => {
@@ -99,6 +102,8 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
             }
 
             internal.strm_table.insert(strm_id, sink);
+
+            log::info!("id = {} : stream opened", strm_id);
             return;
         }
     }
@@ -171,6 +176,7 @@ async fn start_client_dispatch(mut internal: QuicClientInternal) {
             }
 
             _   = future::timeout(timeout, future::pending::<()>()).fuse() => {
+                log::warn!("retransmit event occoured! {:?}", timeout);
                 client_dispatch_timeout(&mut internal).await;
             }
         };
@@ -193,6 +199,7 @@ pub async fn establish(addr: SocketAddr, conf: ClientConfig) -> Result<QuicClien
     let (strm_tx, strm_rx) = sync::channel::<QuicStream>(128);
     let (tx_sink, tx_strm) = sync::channel::<IoSendOps>(258);
 
+    
     let mut internal = QuicClientInternal { 
         // initialize conenctions.
         quic_conn : quiche::connect(conf.ssl_sni.as_deref(), &conf.conn_scid, &mut quic_conf)?, 
@@ -208,7 +215,9 @@ pub async fn establish(addr: SocketAddr, conf: ClientConfig) -> Result<QuicClien
     };
 
     // do client handshake.
+    log::info!("connecting to addr = {}", addr);
     process_client_handshake(&mut internal).await?;
+    log::info!("established addr = {}", addr);
 
     // spawn dispatcher and returns client.
     task::spawn(start_client_dispatch(internal));

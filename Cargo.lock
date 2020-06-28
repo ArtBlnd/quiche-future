@@ -389,6 +389,7 @@ dependencies = [
  "anyhow",
  "async-std",
  "futures",
+ "log",
  "quiche",
 ]
 

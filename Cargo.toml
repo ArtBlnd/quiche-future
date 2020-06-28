@@ -9,3 +9,4 @@ quiche = "*"
 async-std = { version = "*", features = ["unstable"] }
 anyhow = "*"
 futures = "*"
+log = "*"
