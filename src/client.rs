@@ -17,13 +17,17 @@ pub struct QuicClient {
 
 impl QuicClient {
     pub async fn listen_stream(&mut self) -> QuicStream {
-        self.incoming.recv().await.unwrap()
+        let stream = self.incoming.recv().await.unwrap();
+        log::info!("established a new stream (stream_id = {}, listen)", stream.stream_id());
+
+        return stream;
     }
     
     pub async fn create_stream(&mut self, strm_id: u64) -> QuicStream {
         let (rx_sink, rx_strm) = sync::channel::<IoRecvOps>(256);
         self.tx.send(IoSendOps::IoStreamOpen(strm_id, rx_sink)).await;
 
+        log::info!("established a new stream (stream_id = {}, create)", strm_id);
         return QuicStream { 
             stream_id: strm_id,
             recv_close: false,
@@ -89,9 +93,11 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
 
             let mut tmp_buf = [0u8; 4096];
 
-            internal.quic_conn.stream_send(strm_id, &buf, false);
+            internal.quic_conn.stream_send(strm_id, &buf, false)
+                .expect("fatal error! failed to write buffer on bio!");
             while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
-                internal.sock_conn.send(&tmp_buf[0..sz]).await;
+                internal.sock_conn.send(&tmp_buf[0..sz]).await
+                    .expect("fatal error! failed to write buffer on socket!");
             }
 
             log::info!("id = {} : sent {} bytes", strm_id, buf.len());
@@ -156,7 +162,8 @@ async fn client_dispatch_timeout(internal: &mut QuicClientInternal) {
 
     let mut tmp_buf = [0u8; 4096];
     while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
-        internal.sock_conn.send(&tmp_buf[0..sz]).await;
+        internal.sock_conn.send(&tmp_buf[0..sz]).await
+            .expect("fatal error! failed to write buffer on socket!");
     }
 }
 
