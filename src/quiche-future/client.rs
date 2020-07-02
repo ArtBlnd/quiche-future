@@ -251,7 +251,7 @@ async fn start_client_dispatch(mut internal: QuicClientInternal) {
             break;
         }
 
-        if internal_rx.len() % 3 == 0 {
+        if internal_rx.len() % 2 == 0 {
             while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
                 internal.sock_conn.send(&send_buf[0..sz]).await
                     .expect("fatal error! failed to write buffer on socket!");
