@@ -107,24 +107,10 @@ async fn client_process_send(internal: &mut QuicClientInternal, req: IoSendOps) 
 
             internal.quic_conn.stream_send(strm_id, &buf, false)
                 .expect("fatal error! failed to write buffer on bio!");
-            while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
-                internal.sock_conn.send(&tmp_buf[0..sz]).await
-                    .expect("fatal error! failed to write buffer on socket!");
-            }
 
             log::info!("id = {} : sent {} bytes", strm_id, buf.len());
         }
 
-        IoSendOps::IoSendForce() => {
-            let mut tmp_buf = [0u8; 4096];
-
-            while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
-                internal.sock_conn.send(&tmp_buf[0..sz]).await
-                    .expect("fatal error! failed to write buffer on socket!");
-            }
-
-            return;
-        }
 
         IoSendOps::IoStreamOpen(strm_id, sink) => {
             if !internal.strm_table.contains_key(&strm_id) {
@@ -151,7 +137,14 @@ async fn client_process_send(internal: &mut QuicClientInternal, req: IoSendOps) 
 async fn client_process_recv(internal: &mut QuicClientInternal, req: IoRecvOps) {
     match req {
         IoRecvOps::IoRecv(mut buf) => { internal.quic_conn.recv(&mut buf).unwrap(); },
-        IoRecvOps::IoEof() => { internal.recv_closed = true; }
+        IoRecvOps::IoEof() => {
+            for (_, sender) in &internal.strm_table {
+                sender.send(IoRecvOps::IoEof()).await;
+            }
+
+            internal.strm_table.clear();
+            internal.recv_closed = true;
+        }
     }
 
     assert!(internal.recv_closed, "socket is already closed with EOF!");
@@ -194,25 +187,15 @@ async fn client_process_recv(internal: &mut QuicClientInternal, req: IoRecvOps) 
         }
 
         if wbuf.len() > 0 { sink.send(IoRecvOps::IoRecv(wbuf)).await; }
-        if is_fin { sink.send(IoRecvOps::IoEof()).await; }
-
-        // Sending acks.
-        let mut tmp_buf = [0u8; 4096];
-        while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
-            internal.sock_conn.send(&tmp_buf[0..sz]).await
-                .expect("fatal error! failed to write buffer on socket!");
+        if is_fin {
+            sink.send(IoRecvOps::IoEof()).await;
+            internal.strm_table.remove(&strm_id);
         }
     }
 }
 
 async fn client_process_timeout(internal: &mut QuicClientInternal) {
     internal.quic_conn.on_timeout();
-
-    let mut tmp_buf = [0u8; 4096];
-    while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
-        internal.sock_conn.send(&tmp_buf[0..sz]).await
-            .expect("fatal error! failed to write buffer on socket!");
-    }
 }
 
 enum InternalIoOps {
@@ -256,19 +239,25 @@ async fn start_client_dispatch(mut internal: QuicClientInternal) {
     task::spawn(client_dispatch_recv(internal_tx.clone(), internal.sock_conn.clone()));
 
     // start process requests.
+    let mut send_buf = [0u8; 1420];
     while let Ok(req_op) = internal_rx.recv().await {
         match req_op {
             InternalIoOps::IoTimeout() => client_process_timeout(&mut internal).await,
             InternalIoOps::IoSend(send_op) => client_process_send(&mut internal, send_op).await,
             InternalIoOps::IoRecv(recv_op) => client_process_recv(&mut internal, recv_op).await,
         };
+        
+        if internal.quic_conn.is_closed() {
+            break;
+        }
 
-        if internal.send_closed {
-            if internal.quic_conn.is_closed() {
-                break;
+        if internal_rx.len() % 3 == 0 {
+            while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
+                internal.sock_conn.send(&send_buf[0..sz]).await
+                    .expect("fatal error! failed to write buffer on socket!");
             }
 
-            internal_tx.send(InternalIoOps::IoSend(IoSendOps::IoSendForce())).await;
+            return;
         }
 
         if let Some(time) = internal.quic_conn.timeout() {

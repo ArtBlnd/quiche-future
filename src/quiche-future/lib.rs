@@ -45,7 +45,6 @@ pub type IoRecvSink = sync::Sender<IoRecvOps>;
 
 pub enum IoSendOps {
     IoSend(u64, Vec<u8>, Waker),
-    IoSendForce(),
     IoClose(Waker),
     IoFlush(u64, Waker),
     IoStreamFree(u64, Waker),
