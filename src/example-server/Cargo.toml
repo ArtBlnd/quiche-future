@@ -1,0 +1,16 @@
+[package]
+name = "example-server"
+version = "0.1.0"
+authors = ["Jun Ryoung Ju <junryoungju@gmail.com>"]
+edition = "2018"
+
+[[bin]]
+name = "example_server"
+path = "bin.rs"
+
+[dependencies]
+async-std = { version = "*", features = ["unstable"] }
+anyhow = "*"
+futures = "*"
+log = "*"
+quiche-future = { path = "../quiche-future" }

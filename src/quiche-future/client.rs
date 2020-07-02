@@ -11,32 +11,38 @@ use futures::select;
 use log;
 
 pub struct QuicClient {
-    incoming: sync::Receiver<QuicStream>,
+    incoming: sync::Receiver<(QuicSendStream, QuicRecvStream)>,
     tx: IoSendSink
 }
 
 impl QuicClient {
-    pub async fn listen_stream(&mut self) -> QuicStream {
-        let stream = self.incoming.recv().await.unwrap();
-        log::info!("established a new stream (stream_id = {}, listen)", stream.stream_id());
+    pub async fn listen_stream(&mut self) -> (QuicSendStream, QuicRecvStream) {
+        let (send_stream, recv_stream) = self.incoming.recv().await.unwrap();
+        log::info!("established a new stream (stream_id = {}, listen)", send_stream.stream_id());
 
-        return stream;
+        return (send_stream, recv_stream);
     }
     
-    pub async fn create_stream(&mut self, strm_id: u64) -> QuicStream {
+    pub async fn create_stream(&mut self, strm_id: u64) -> (QuicSendStream, QuicRecvStream) {
         let (rx_sink, rx_strm) = sync::channel::<IoRecvOps>(256);
         self.tx.send(IoSendOps::IoStreamOpen(strm_id, rx_sink)).await;
 
         log::info!("established a new stream (stream_id = {}, create)", strm_id);
-        return QuicStream { 
+        let send_stream = QuicSendStream {
             stream_id: strm_id,
-            recv_close: false,
-            recv_flush: false,
-            local_storage: None,
+            send_close: false,
+            send_flush: false,
             tx_pending: Mutex::new(HashSet::new()),
             tx: self.tx.clone(), 
+        };
+
+        let recv_stream = QuicRecvStream {
+            stream_id: strm_id,
+            local_storage: None,
             rx: rx_strm
         };
+
+        return (send_stream, recv_stream);
     }
 }
 
@@ -44,7 +50,7 @@ struct QuicClientInternal {
     quic_conn: Pin<Box<quiche::Connection>>,
     sock_conn: net::UdpSocket, 
 
-    strm_tx: sync::Sender<QuicStream>,
+    strm_tx: sync::Sender<(QuicSendStream, QuicRecvStream)>,
     strm_table: HashMap<u64, IoRecvSink>,
 
     tx_sink: IoSendSink,
@@ -53,7 +59,7 @@ struct QuicClientInternal {
 
 
 async fn process_client_handshake(internal: &mut QuicClientInternal) -> Result<(), anyhow::Error> {
-    while internal.quic_conn.is_established() {
+    while !internal.quic_conn.is_established() {
         let mut buf = [0u8; 4096];
 
         loop {
@@ -80,6 +86,7 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
         IoSendOps::IoFlush(strm_id, waker) => {
             wk = waker; 
         }
+
         IoSendOps::IoClose(strm_id, waker) => { 
             wk = waker;
             internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
@@ -128,15 +135,21 @@ async fn client_dispatch_recv(internal: &mut QuicClientInternal, buf: &mut [u8])
         if !internal.strm_table.contains_key(&strm_id) {
             let (rx_sink, rx_strm) = sync::channel::<IoRecvOps>(256);
 
-            internal.strm_tx.send(QuicStream {
+            let send_stream = QuicSendStream {
                 stream_id: strm_id,
-                recv_close: false,
-                recv_flush: false,
-                local_storage: None,
+                send_close: false,
+                send_flush: false,
                 tx_pending: Mutex::new(HashSet::new()),
                 tx: internal.tx_sink.clone(), 
+            };
+
+            let recv_stream = QuicRecvStream {
+                stream_id: strm_id,
+                local_storage: None,
                 rx: rx_strm
-            }).await;
+            };
+
+            internal.strm_tx.send((send_stream, recv_stream)).await;
             internal.strm_table.insert(strm_id, rx_sink);
         }
 
@@ -154,6 +167,13 @@ async fn client_dispatch_recv(internal: &mut QuicClientInternal, buf: &mut [u8])
 
         if wbuf.len() > 0 { sink.send(IoRecvOps::IoRecv(wbuf)).await; }
         if is_fin { sink.send(IoRecvOps::IoEof()).await; }
+
+        // Sending acks.
+        let mut tmp_buf = [0u8; 4096];
+        while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
+            internal.sock_conn.send(&tmp_buf[0..sz]).await
+                .expect("fatal error! failed to write buffer on socket!");
+        }
     }
 }
 
@@ -184,7 +204,7 @@ async fn start_client_dispatch(mut internal: QuicClientInternal) {
                 client_dispatch_recv(&mut internal, &mut tmp_buf[0..len.unwrap()]).await;
             }
 
-            _   = future::timeout(timeout, future::pending::<()>()).fuse() => {
+            _   = task::sleep(timeout).fuse() => {
                 log::warn!("retransmit event occoured! {:?}", timeout);
                 client_dispatch_timeout(&mut internal).await;
             }
@@ -204,15 +224,20 @@ pub async fn establish(addr: SocketAddr, conf: ClientConfig) -> Result<QuicClien
     quic_conf.set_initial_max_stream_data_uni(conf.pl_init_max_uni_sz as u64);
     quic_conf.set_max_idle_timeout(conf.conn_timeout as u64);
     quic_conf.set_max_packet_size(conf.conn_max_udp_size as u64);
+    quic_conf.set_disable_active_migration(true);
+    quic_conf.set_application_protos(b"\x06fibers").unwrap();
+    quic_conf.load_cert_chain_from_pem_file("assets/client.pem").unwrap();
 
-    let (strm_tx, strm_rx) = sync::channel::<QuicStream>(128);
+    let (strm_tx, strm_rx) = sync::channel::<(QuicSendStream, QuicRecvStream)>(128);
     let (tx_sink, tx_strm) = sync::channel::<IoSendOps>(258);
 
+    let socket = net::UdpSocket::bind("127.0.0.1:0").await?;
+    socket.connect(addr).await?;
     
     let mut internal = QuicClientInternal { 
         // initialize conenctions.
         quic_conn : quiche::connect(conf.ssl_sni.as_deref(), &conf.conn_scid, &mut quic_conf)?, 
-        sock_conn : net::UdpSocket::bind(addr).await.expect("failed to bind socket!"),
+        sock_conn : socket,
 
         // initialize stream helpers.
         strm_tx   : strm_tx,
