@@ -47,6 +47,10 @@ impl QuicClient {
 
         return (send_stream, recv_stream);
     }
+
+    pub async fn close(&mut self) {
+        self.tx.send(IoSendOps::IoClose()).await;
+    }
 }
 
 struct QuicClientInternal {
@@ -89,15 +93,17 @@ async fn client_process_send(internal: &mut QuicClientInternal, req: IoSendOps) 
     let wk;
 
     match req { 
-        IoSendOps::IoFlush(strm_id, waker) => {
+        IoSendOps::IoFlush(_, waker) => {
             wk = waker; 
         }
 
-        IoSendOps::IoClose(waker) => {
-            wk = waker;
+        IoSendOps::IoClose() => {
+            if let Err(_) = internal.quic_conn.close(true, 0, b"") {
+                log::warn!("closing connection that is already closed!");
+            }
 
-            internal.quic_conn.close(true, 0, b"");
             internal.send_closed = true;
+            return;
         }
 
         IoSendOps::IoSend(strm_id, buf, waker) => {

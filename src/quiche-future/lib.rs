@@ -45,7 +45,7 @@ pub type IoRecvSink = sync::Sender<IoRecvOps>;
 
 pub enum IoSendOps {
     IoSend(u64, Vec<u8>, Waker),
-    IoClose(Waker),
+    IoClose(),
     IoFlush(u64, Waker),
     IoStreamFree(u64, Waker),
     IoStreamOpen(u64, IoRecvSink)
@@ -195,7 +195,7 @@ impl futures::AsyncWrite for QuicSendStream {
             return Poll::Ready(Ok(()));
         }
 
-        task::block_on( async { 
+        task::block_on( async {
             self_mut.tx.send(IoSendOps::IoStreamFree(self_mut.stream_id, cx.waker().clone())).await;
             self_mut.send_close = true;
         });
