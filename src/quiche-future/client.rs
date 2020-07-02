@@ -1,13 +1,16 @@
 use crate::*;
 
+use async_std::*;
+use async_std::prelude::*;
+use async_std::sync::Arc;
+
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::collections::{HashMap};
+use std::time::Duration;
 
 use anyhow;
-use async_std::*;
 use quiche;
-use futures::select;
 use log;
 
 pub struct QuicClient {
@@ -47,8 +50,11 @@ impl QuicClient {
 }
 
 struct QuicClientInternal {
+    send_closed: bool,
+    recv_closed: bool,
+
     quic_conn: Pin<Box<quiche::Connection>>,
-    sock_conn: net::UdpSocket, 
+    sock_conn: Arc<net::UdpSocket>, 
 
     strm_tx: sync::Sender<(QuicSendStream, QuicRecvStream)>,
     strm_table: HashMap<u64, IoRecvSink>,
@@ -79,7 +85,7 @@ async fn process_client_handshake(internal: &mut QuicClientInternal) -> Result<(
     Ok(())
 }
 
-async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps) {
+async fn client_process_send(internal: &mut QuicClientInternal, req: IoSendOps) {
     let wk;
 
     match req { 
@@ -87,15 +93,14 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
             wk = waker; 
         }
 
-        IoSendOps::IoClose(strm_id, waker) => { 
+        IoSendOps::IoClose(waker) => {
             wk = waker;
-            internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
 
-            log::info!("id = {} : stream closed", strm_id);
+            internal.quic_conn.close(true, 0, b"");
+            internal.send_closed = true;
         }
 
         IoSendOps::IoSend(strm_id, buf, waker) => {
-            
             wk = waker;
 
             let mut tmp_buf = [0u8; 4096];
@@ -110,6 +115,17 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
             log::info!("id = {} : sent {} bytes", strm_id, buf.len());
         }
 
+        IoSendOps::IoSendForce() => {
+            let mut tmp_buf = [0u8; 4096];
+
+            while let Ok(sz) = internal.quic_conn.send(&mut tmp_buf) {
+                internal.sock_conn.send(&tmp_buf[0..sz]).await
+                    .expect("fatal error! failed to write buffer on socket!");
+            }
+
+            return;
+        }
+
         IoSendOps::IoStreamOpen(strm_id, sink) => {
             if !internal.strm_table.contains_key(&strm_id) {
                 // should not be opend!
@@ -120,13 +136,25 @@ async fn client_dispatch_send(internal: &mut QuicClientInternal, req: IoSendOps)
             log::info!("id = {} : stream opened", strm_id);
             return;
         }
+
+        IoSendOps::IoStreamFree(strm_id, waker) => { 
+            wk = waker;
+            internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
+
+            log::info!("id = {} : stream closed", strm_id);
+        }
     }
 
     wk.wake();
 }
 
-async fn client_dispatch_recv(internal: &mut QuicClientInternal, buf: &mut [u8]) {
-    internal.quic_conn.recv(buf).unwrap();
+async fn client_process_recv(internal: &mut QuicClientInternal, req: IoRecvOps) {
+    match req {
+        IoRecvOps::IoRecv(mut buf) => { internal.quic_conn.recv(&mut buf).unwrap(); },
+        IoRecvOps::IoEof() => { internal.recv_closed = true; }
+    }
+
+    assert!(internal.recv_closed, "socket is already closed with EOF!");
 
     let mut tmp_buf = [0u8; 4096];
 
@@ -177,7 +205,7 @@ async fn client_dispatch_recv(internal: &mut QuicClientInternal, buf: &mut [u8])
     }
 }
 
-async fn client_dispatch_timeout(internal: &mut QuicClientInternal) {
+async fn client_process_timeout(internal: &mut QuicClientInternal) {
     internal.quic_conn.on_timeout();
 
     let mut tmp_buf = [0u8; 4096];
@@ -187,29 +215,66 @@ async fn client_dispatch_timeout(internal: &mut QuicClientInternal) {
     }
 }
 
-async fn start_client_dispatch(mut internal: QuicClientInternal) {
-    let mut tmp_buf = [0u8; 4096];
+enum InternalIoOps {
+    IoTimeout(),
+    IoSend(IoSendOps),
+    IoRecv(IoRecvOps),
+}
 
-    loop {
-        let timeout = internal.quic_conn.timeout().unwrap_or(std::time::Duration::from_secs(60));
-
-        select! {
-            req = internal.tx_strm.recv().fuse() => { 
-                if req.is_err() { break; }
-                client_dispatch_send(&mut internal, req.unwrap()).await;
-            }
-
-            len = internal.sock_conn.recv(&mut tmp_buf).fuse() => {
-                if len.is_err() { break; }
-                client_dispatch_recv(&mut internal, &mut tmp_buf[0..len.unwrap()]).await;
-            }
-
-            _   = task::sleep(timeout).fuse() => {
-                log::warn!("retransmit event occoured! {:?}", timeout);
-                client_dispatch_timeout(&mut internal).await;
-            }
-        };
+async fn client_dispatch_send(tx: sync::Sender<InternalIoOps>, strm: IoSendStream) {
+    while let Ok(op) = strm.recv().await {
+        tx.send(InternalIoOps::IoSend(op)).await;
     }
+}
+
+async fn client_dispatch_recv(tx: sync::Sender<InternalIoOps>, sock: Arc<net::UdpSocket>) {
+    let mut buf = Vec::new();
+    buf.reserve(1480);
+
+    while let Ok(sz) = sock.recv(&mut buf).await {
+        if sz == 0 {
+            tx.send(InternalIoOps::IoRecv(IoRecvOps::IoEof())).await;
+            break;
+        }
+
+        tx.send(InternalIoOps::IoRecv(IoRecvOps::IoRecv(buf))).await;
+        
+        buf = Vec::new();
+        buf.reserve(1480);
+    }
+}
+
+async fn client_dispatch_timeout(tx: sync::Sender<InternalIoOps>, time: Duration) {
+    task::sleep(time).await;
+    tx.send(InternalIoOps::IoTimeout()).await;
+}
+
+async fn start_client_dispatch(mut internal: QuicClientInternal) {
+    let (internal_tx, internal_rx) = sync::channel::<InternalIoOps>(128);
+
+    task::spawn(client_dispatch_send(internal_tx.clone(), internal.tx_strm.clone()));
+    task::spawn(client_dispatch_recv(internal_tx.clone(), internal.sock_conn.clone()));
+
+    // start process requests.
+    while let Ok(req_op) = internal_rx.recv().await {
+        match req_op {
+            InternalIoOps::IoTimeout() => client_process_timeout(&mut internal).await,
+            InternalIoOps::IoSend(send_op) => client_process_send(&mut internal, send_op).await,
+            InternalIoOps::IoRecv(recv_op) => client_process_recv(&mut internal, recv_op).await,
+        };
+
+        if internal.send_closed {
+            if internal.quic_conn.is_closed() {
+                break;
+            }
+
+            internal_tx.send(InternalIoOps::IoSend(IoSendOps::IoSendForce())).await;
+        }
+
+        if let Some(time) = internal.quic_conn.timeout() {
+            task::spawn(client_dispatch_timeout(internal_tx.clone(), time));
+        }
+    };
 
     return;
 }
@@ -235,9 +300,12 @@ pub async fn establish(addr: SocketAddr, conf: ClientConfig) -> Result<QuicClien
     socket.connect(addr).await?;
     
     let mut internal = QuicClientInternal { 
+        send_closed: false,
+        recv_closed: false,
+
         // initialize conenctions.
         quic_conn : quiche::connect(conf.ssl_sni.as_deref(), &conf.conn_scid, &mut quic_conf)?, 
-        sock_conn : socket,
+        sock_conn : Arc::new(socket),
 
         // initialize stream helpers.
         strm_tx   : strm_tx,
