@@ -31,6 +31,7 @@ pub struct ClientConfig {
     pub conn_timeout: usize,
     pub conn_max_udp_size: usize,
     pub conn_scid: [u8; 20],
+    pub conn_alpn: Vec<u8>
 }
 
 #[derive(Default)]
