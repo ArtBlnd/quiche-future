@@ -1,23 +1,29 @@
-pub mod client;
-pub mod server;
-
 use std::pin::Pin;
 use std::task::{ Poll, Context, Waker};
 use std::collections::{ HashSet };
-use std::sync::{ Mutex };
 use std::io::Error;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
+use std::collections::{HashMap};
+use std::time::Duration;
 
 use async_std::*;
+use async_std::io::{ Read, Write };
+use async_std::sync::{ channel, Receiver, Sender, Arc, Mutex };
+use async_std::task::JoinHandle;
+
 use futures::{ ready, pin_mut };
 use futures::FutureExt;
+
+use anyhow;
+use quiche;
+use log;
 
 #[derive(Default)]
 pub struct ClientConfig {
     // SSL configurations.
     pub ssl_verify: bool,
     pub ssl_sni: Option<String>,
-    pub ssl_key: Vec<u8>,
     pub ssl_ca_cert: Vec<u8>,
 
     // Payload configurations.
@@ -36,13 +42,28 @@ pub struct ClientConfig {
 
 #[derive(Default)]
 pub struct ServerConfig {
-    
+    // SSL configurations.
+    pub ssl_key: Vec<u8>,
+    pub ssl_cert: Vec<u8>,
+
+    // Payload configurations.
+    pub pl_init_max_sz: usize,
+    pub pl_init_max_bidi_sz: usize,
+    pub pl_init_max_uni_sz: usize,
+    pub pl_max_bidi_streams: usize,
+    pub pl_max_uni_streams: usize,
+
+    // Connection configurations.
+    pub conn_timeout: usize,
+    pub conn_max_udp_size: usize,
+    pub conn_scid: [u8; 20],
+    pub conn_alpn: Vec<u8>
 }
 
-pub type IoSendStream = sync::Receiver<IoSendOps>;
-pub type IoSendSink = sync::Sender<IoSendOps>;
-pub type IoRecvStream = sync::Receiver<IoRecvOps>;
-pub type IoRecvSink = sync::Sender<IoRecvOps>;
+pub type IoSendStream = Receiver<IoSendOps>;
+pub type IoSendSink = Sender<IoSendOps>;
+pub type IoRecvStream = Receiver<IoRecvOps>;
+pub type IoRecvSink = Sender<IoRecvOps>;
 
 pub enum IoSendOps {
     IoSend(u64, Vec<u8>, Waker),
@@ -88,7 +109,7 @@ pub struct QuicSendStream {
     send_close: bool,
     send_flush: bool,
 
-    tx_pending: Mutex<HashSet<usize>>,
+    tx_pending: std::sync::Mutex<HashSet<usize>>,
     tx: IoSendSink,
 }
 
@@ -98,7 +119,7 @@ impl QuicSendStream {
     }
 }
 
-impl futures::AsyncRead for QuicRecvStream {
+impl Read for QuicRecvStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, wbuf: &mut [u8]) -> Poll<Result<usize, Error>> {
         let self_mut = self.get_mut();
 
@@ -108,10 +129,7 @@ impl futures::AsyncRead for QuicRecvStream {
 
             wbuf[..len].copy_from_slice(&rbuf[..len]);
             if rbuf.len() != len {
-                let mut new_storage = Vec::new();
-                new_storage.extend_from_slice(&rbuf[len..]);
-
-                self_mut.local_storage = Some(new_storage);
+                self_mut.local_storage = Some(rbuf[len..].to_vec().clone());
             }
 
             return Poll::Ready(Ok(len));
@@ -143,7 +161,7 @@ impl futures::AsyncRead for QuicRecvStream {
     }
 }
 
-impl futures::AsyncWrite for QuicSendStream {
+impl Write for QuicSendStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, rbuf: &[u8]) -> Poll<Result<usize, Error>> {
         let self_mut = self.get_mut();
 
@@ -203,4 +221,600 @@ impl futures::AsyncWrite for QuicSendStream {
 
         return Poll::Pending;
     }
+}
+
+pub struct QuicConn {
+    incoming: Receiver<(QuicSendStream, QuicRecvStream)>,
+    tx: IoSendSink
+}
+
+struct QuicClientInternal {
+    send_closed: bool,
+    recv_closed: bool,
+
+    quic_conn: Pin<Box<quiche::Connection>>,
+    sock_conn: Arc<net::UdpSocket>, 
+
+    strm_sink: Sender<(QuicSendStream, QuicRecvStream)>,
+    strm_table: HashMap<u64, IoRecvSink>,
+
+    send_sink: IoSendSink,
+    send_strm: IoSendStream,
+}
+
+impl QuicConn {
+    pub async fn listen_stream(&mut self) -> (QuicSendStream, QuicRecvStream) {
+        let (send_stream, recv_stream) = self.incoming.recv().await.unwrap();
+        log::info!("established a new stream (stream_id = {}, listen)", send_stream.stream_id());
+
+        return (send_stream, recv_stream);
+    }
+    
+    pub async fn create_stream(&mut self, strm_id: u64) -> (QuicSendStream, QuicRecvStream) {
+        let (rx_sink, rx_strm) = channel::<IoRecvOps>(128);
+        self.tx.send(IoSendOps::IoStreamOpen(strm_id, rx_sink)).await;
+
+        log::info!("established a new stream (stream_id = {}, create)", strm_id);
+        let send_stream = QuicSendStream {
+            stream_id: strm_id,
+            send_close: false,
+            send_flush: false,
+            tx_pending: Default::default(),
+            tx: self.tx.clone(), 
+        };
+
+        let recv_stream = QuicRecvStream {
+            stream_id: strm_id,
+            local_storage: None,
+            rx: rx_strm
+        };
+
+        return (send_stream, recv_stream);
+    }
+
+    pub async fn close(&mut self) {
+        self.tx.send(IoSendOps::IoClose()).await;
+    }
+}
+
+async fn process_client_handshake(internal: &mut QuicClientInternal) -> Result<(), anyhow::Error> {
+    while !internal.quic_conn.is_established() {
+        let mut buf = [0u8; 4096];
+
+        loop {
+            match internal.quic_conn.send(&mut buf) {
+                Ok (v)                   => internal.sock_conn.send(&buf[0..v]).await?,
+                Err(quiche::Error::Done) => break,
+                Err(_)                   => unreachable!(),
+            };
+        }
+
+        match internal.sock_conn.recv(&mut buf).await {
+            Ok (v) => internal.quic_conn.recv(&mut buf[0..v])?,
+            Err(_) => unreachable!()
+        };
+    }
+
+    Ok(())
+}
+
+async fn process_client_send(internal: &mut QuicClientInternal, req: IoSendOps) {
+    let wk;
+
+    match req { 
+        IoSendOps::IoFlush(_, waker) => {
+            wk = waker; 
+        }
+
+        IoSendOps::IoClose() => {
+            if let Err(_) = internal.quic_conn.close(true, 0, b"") {
+                log::warn!("closing connection that is already closed!");
+            }
+
+            internal.send_closed = true;
+            return;
+        }
+
+        IoSendOps::IoSend(strm_id, buf, waker) => {
+            wk = waker;
+
+            internal.quic_conn.stream_send(strm_id, &buf, false)
+                .expect("fatal error! failed to write buffer on bio!");
+        }
+
+
+        IoSendOps::IoStreamOpen(strm_id, sink) => {
+            if !internal.strm_table.contains_key(&strm_id) {
+                // should not be opend!
+            }
+
+            internal.strm_table.insert(strm_id, sink);
+
+            log::info!("id = {} : stream opened", strm_id);
+            return;
+        }
+
+        IoSendOps::IoStreamFree(strm_id, waker) => { 
+            wk = waker;
+            internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
+
+            log::info!("id = {} : stream closed", strm_id);
+        }
+    }
+
+    wk.wake();
+}
+
+async fn process_client_recv(internal: &mut QuicClientInternal, req: IoRecvOps) {
+    match req {
+        IoRecvOps::IoRecv(mut buf) => { internal.quic_conn.recv(&mut buf).unwrap(); },
+        IoRecvOps::IoEof() => {
+            for (_, sender) in &internal.strm_table {
+                sender.send(IoRecvOps::IoEof()).await;
+            }
+
+            internal.strm_table.clear();
+            internal.recv_closed = true;
+        }
+    }
+
+    assert!(internal.recv_closed, "socket is already closed with EOF!");
+
+    let mut tmp_buf = [0u8; 4096];
+
+    let strm_id_iter = internal.quic_conn.readable();
+    for strm_id in strm_id_iter {
+        if !internal.strm_table.contains_key(&strm_id) {
+            let (rx_sink, rx_strm) = channel::<IoRecvOps>(128);
+
+            let send_stream = QuicSendStream {
+                stream_id: strm_id,
+                send_close: false,
+                send_flush: false,
+                tx_pending: Default::default(),
+                tx: internal.send_sink.clone(), 
+            };
+
+            let recv_stream = QuicRecvStream {
+                stream_id: strm_id,
+                local_storage: None,
+                rx: rx_strm
+            };
+
+            internal.strm_sink.send((send_stream, recv_stream)).await;
+            internal.strm_table.insert(strm_id, rx_sink);
+        }
+
+        let sink = internal.strm_table.get_mut(&strm_id).unwrap();
+
+        let mut is_fin = false;
+        let mut wbuf = Vec::new();
+        while let Ok((len, fin)) = internal.quic_conn.stream_recv(strm_id, &mut tmp_buf) {
+            if len != 0 {
+                wbuf.extend_from_slice(&tmp_buf[0..len]);
+            }
+
+            is_fin |= fin;
+        }
+
+        if wbuf.len() > 0 { sink.send(IoRecvOps::IoRecv(wbuf)).await; }
+        if is_fin {
+            sink.send(IoRecvOps::IoEof()).await;
+            internal.strm_table.remove(&strm_id);
+        }
+    }
+}
+
+async fn process_client_timeout(internal: &mut QuicClientInternal) {
+    internal.quic_conn.on_timeout();
+}
+
+enum InternalIoOps {
+    IoTimeout(),
+    IoSend(IoSendOps),
+    IoRecv(IoRecvOps),
+}
+
+async fn dispatch_client_send(tx: Sender<InternalIoOps>, strm: IoSendStream) {
+    while let Ok(op) = strm.recv().await {
+        tx.send(InternalIoOps::IoSend(op)).await;
+    }
+}
+
+async fn dispatch_client_recv(tx: Sender<InternalIoOps>, sock: Arc<net::UdpSocket>) {
+    let mut buf = [0u8; 4096];
+
+    while let Ok(sz) = sock.recv(&mut buf).await {
+        if sz == 0 {
+            tx.send(InternalIoOps::IoRecv(IoRecvOps::IoEof())).await;
+            break;
+        }
+
+        tx.send(InternalIoOps::IoRecv(IoRecvOps::IoRecv(buf[..sz].to_vec().clone()))).await;
+    }
+}
+
+async fn dispatch_client_timeout(tx: Sender<InternalIoOps>, time: Duration) {
+    task::sleep(time).await;
+    tx.send(InternalIoOps::IoTimeout()).await;
+}
+
+async fn dispatch_client_connection(mut internal: QuicClientInternal) {
+    let (internal_tx, internal_rx) = channel::<InternalIoOps>(128);
+
+    let h1 = task::spawn(dispatch_client_send(internal_tx.clone(), internal.send_strm.clone()));
+    let h2 = task::spawn(dispatch_client_recv(internal_tx.clone(), internal.sock_conn.clone()));
+
+    // start process requests.
+    let mut send_buf = [0u8; 1420];
+    while let Ok(req_op) = internal_rx.recv().await {
+        match req_op {
+            InternalIoOps::IoTimeout() => process_client_timeout(&mut internal).await,
+            InternalIoOps::IoSend(send_op) => process_client_send(&mut internal, send_op).await,
+            InternalIoOps::IoRecv(recv_op) => process_client_recv(&mut internal, recv_op).await,
+        };
+        
+        if internal.quic_conn.is_closed() {
+            break;
+        }
+
+        if internal_rx.len() % 2 == 0 {
+            while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
+                internal.sock_conn.send(&send_buf[0..sz]).await
+                    .expect("fatal error! failed to write buffer on socket!");
+            }
+
+            return;
+        }
+
+        if let Some(time) = internal.quic_conn.timeout() {
+            task::spawn(dispatch_client_timeout(internal_tx.clone(), time));
+        }
+    };
+
+    h1.await;
+    h2.await;
+}
+
+pub async fn establish_client(bind_addr: SocketAddr, conn_addr: SocketAddr, conf: ClientConfig) -> Result<QuicConn, anyhow::Error> {
+    let mut quic_conf = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    quic_conf.verify_peer(conf.ssl_verify);
+    quic_conf.set_initial_max_data(conf.pl_init_max_sz as u64);
+    quic_conf.set_initial_max_stream_data_bidi_local(conf.pl_init_max_bidi_sz as u64);
+    quic_conf.set_initial_max_stream_data_bidi_remote(conf.pl_init_max_bidi_sz as u64);
+    quic_conf.set_initial_max_streams_bidi(conf.pl_max_bidi_streams as u64);
+    quic_conf.set_initial_max_stream_data_uni(conf.pl_init_max_uni_sz as u64);
+    quic_conf.set_max_idle_timeout(conf.conn_timeout as u64);
+    quic_conf.set_max_packet_size(conf.conn_max_udp_size as u64);
+    quic_conf.set_disable_active_migration(true);
+    quic_conf.set_application_protos(&conf.conn_alpn).unwrap();
+    quic_conf.load_cert_chain_from_pem_file("assets/client.pem").unwrap();
+
+    let (strm_sink, strm_strm) = channel::<(QuicSendStream, QuicRecvStream)>(128);
+    let (send_sink, send_strm) = channel::<IoSendOps>(128);
+
+    let socket = net::UdpSocket::bind(bind_addr).await?;
+    socket.connect(conn_addr).await?;
+    
+    let mut internal = QuicClientInternal { 
+        send_closed: false,
+        recv_closed: false,
+
+        // initialize conenctions.
+        quic_conn : quiche::connect(conf.ssl_sni.as_deref(), &conf.conn_scid, &mut quic_conf)?, 
+        sock_conn : Arc::new(socket),
+
+        // initialize stream helpers.
+        strm_sink : strm_sink,
+        strm_table: HashMap::new(),
+
+        // initialize sender channels.
+        send_sink : send_sink.clone(),
+        send_strm : send_strm.clone(),
+    };
+
+    // do client handshake.
+    log::info!("connecting to addr = {}", conn_addr);
+    process_client_handshake(&mut internal).await?;
+    log::info!("established addr = {}", conn_addr);
+
+    // spawn dispatcher and returns client.
+    task::spawn(dispatch_client_connection(internal));
+
+    return Ok(QuicConn {incoming: strm_strm, tx: send_sink});
+}
+
+
+pub struct QuicServer {
+    rx: Receiver<QuicConn>
+}
+
+impl QuicServer {
+    pub async fn listen(&self) -> Option<QuicConn> {
+        match self.rx.recv().await {
+            Ok (s) => Some(s),
+            Err(_) => None,
+        }
+    }
+}
+
+
+struct QuicServerInternal {
+    send_closed: bool,
+    recv_closed: bool,
+
+    quic_conn: Pin<Box<quiche::Connection>>,
+    sock_conn: Arc<net::UdpSocket>, 
+
+    strm_sink: Sender<(QuicSendStream, QuicRecvStream)>,
+    strm_table: HashMap<u64, IoRecvSink>,
+
+    recv_strm: IoRecvStream,
+
+    send_sink: IoSendSink,
+    send_strm: IoSendStream,
+}
+
+
+async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) {
+    let wk;
+
+    match req { 
+        IoSendOps::IoFlush(_, waker) => {
+            wk = waker; 
+        }
+
+        IoSendOps::IoClose() => {
+            if let Err(_) = internal.quic_conn.close(true, 0, b"") {
+                log::warn!("closing connection that is already closed!");
+            }
+
+            internal.send_closed = true;
+            return;
+        }
+
+        IoSendOps::IoSend(strm_id, buf, waker) => {
+            wk = waker;
+
+            internal.quic_conn.stream_send(strm_id, &buf, false)
+                .expect("fatal error! failed to write buffer on bio!");
+        }
+
+
+        IoSendOps::IoStreamOpen(strm_id, sink) => {
+            if !internal.strm_table.contains_key(&strm_id) {
+                // should not be opend!
+            }
+
+            internal.strm_table.insert(strm_id, sink);
+
+            log::info!("id = {} : stream opened", strm_id);
+            return;
+        }
+
+        IoSendOps::IoStreamFree(strm_id, waker) => { 
+            wk = waker;
+            internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
+
+            log::info!("id = {} : stream closed", strm_id);
+        }
+    }
+
+    wk.wake();
+}
+
+async fn process_server_recv(internal: &mut QuicServerInternal, req: IoRecvOps) {
+    match req {
+        IoRecvOps::IoRecv(mut buf) => { internal.quic_conn.recv(&mut buf).unwrap(); },
+        IoRecvOps::IoEof() => {
+            for (_, sender) in &internal.strm_table {
+                sender.send(IoRecvOps::IoEof()).await;
+            }
+
+            internal.strm_table.clear();
+            internal.recv_closed = true;
+        }
+    }
+
+    assert!(internal.recv_closed, "socket is already closed with EOF!");
+
+    let mut tmp_buf = [0u8; 4096];
+
+    let strm_id_iter = internal.quic_conn.readable();
+    for strm_id in strm_id_iter {
+        if !internal.strm_table.contains_key(&strm_id) {
+            let (rx_sink, rx_strm) = channel::<IoRecvOps>(128);
+
+            let send_stream = QuicSendStream {
+                stream_id: strm_id,
+                send_close: false,
+                send_flush: false,
+                tx_pending: Default::default(),
+                tx: internal.send_sink.clone(), 
+            };
+
+            let recv_stream = QuicRecvStream {
+                stream_id: strm_id,
+                local_storage: None,
+                rx: rx_strm
+            };
+
+            internal.strm_sink.send((send_stream, recv_stream)).await;
+            internal.strm_table.insert(strm_id, rx_sink);
+        }
+
+        let sink = internal.strm_table.get_mut(&strm_id).unwrap();
+
+        let mut is_fin = false;
+        let mut wbuf = Vec::new();
+        while let Ok((len, fin)) = internal.quic_conn.stream_recv(strm_id, &mut tmp_buf) {
+            if len != 0 {
+                wbuf.extend_from_slice(&tmp_buf[0..len]);
+            }
+
+            is_fin |= fin;
+        }
+
+        if wbuf.len() > 0 { sink.send(IoRecvOps::IoRecv(wbuf)).await; }
+        if is_fin {
+            sink.send(IoRecvOps::IoEof()).await;
+            internal.strm_table.remove(&strm_id);
+        }
+    }
+}
+
+async fn process_server_timeout(internal: &mut QuicServerInternal) {
+    internal.quic_conn.on_timeout();
+}
+
+
+async fn dispatch_server_send(tx: Sender<InternalIoOps>, strm: IoSendStream) {
+    while let Ok(op) = strm.recv().await {
+        tx.send(InternalIoOps::IoSend(op)).await;
+    }
+}
+
+async fn dispatch_server_recv(tx: Sender<InternalIoOps>, strm: IoRecvStream) {
+    while let Ok(op) = strm.recv().await {
+        tx.send(InternalIoOps::IoRecv(op)).await;
+    }
+}
+
+async fn dispatch_server_connection(mut internal: QuicServerInternal) {
+    let (internal_tx, internal_rx) = channel::<InternalIoOps>(128);
+
+    let h1 = task::spawn(dispatch_server_send(internal_tx.clone(), internal.send_strm.clone()));
+    let h2 = task::spawn(dispatch_server_recv(internal_tx.clone(), internal.recv_strm.clone()));
+
+    // start process requests.
+    let mut send_buf = [0u8; 1420];
+    while let Ok(req_op) = internal_rx.recv().await {
+        match req_op {
+            InternalIoOps::IoTimeout() => process_server_timeout(&mut internal).await,
+            InternalIoOps::IoSend(send_op) => process_server_send(&mut internal, send_op).await,
+            InternalIoOps::IoRecv(recv_op) => process_server_recv(&mut internal, recv_op).await,
+        };
+        
+        if internal.quic_conn.is_closed() {
+            break;
+        }
+
+        if internal_rx.len() % 2 == 0 {
+            while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
+                internal.sock_conn.send(&send_buf[0..sz]).await
+                    .expect("fatal error! failed to write buffer on socket!");
+            }
+
+            return;
+        }
+
+        if let Some(time) = internal.quic_conn.timeout() {
+            task::spawn(dispatch_client_timeout(internal_tx.clone(), time));
+        }
+    };
+
+    h1.await;
+    h2.await;
+}
+
+async fn wait_and_remove(table: Arc<Mutex<HashMap<Vec<u8>, IoRecvSink>>>, id: Vec<u8>, handle: JoinHandle<()>) {
+    handle.await;
+    table.lock().await.remove(&id);
+}
+
+pub async fn dispatch_server_packets(conn_tx: Sender<QuicConn>, sock_conn: Arc<net::UdpSocket>, mut quic_conf: quiche::Config) {
+    let client_table: Arc<Mutex<HashMap<Vec<u8>, IoRecvSink>>> = Default::default();
+
+    let mut buf = [0u8; 4096];
+    while let Ok((len, src)) = sock_conn.recv_from(&mut buf).await {
+        let mut table = client_table.lock().await;
+
+        if len == 0 {
+            // EOF found.
+            for (_, tx) in table.iter_mut() {
+                tx.send(IoRecvOps::IoEof()).await
+            }
+        }
+
+        let quic_header = match quiche::Header::from_slice(&mut buf[..len], quiche::MAX_CONN_ID_LEN) {
+            Ok (v) => v,
+            Err(_) => continue
+        };
+
+        // check its begin of connection
+        if !table.contains_key(&quic_header.dcid) {
+            if quic_header.ty != quiche::Type::Initial {
+                // bad quic packet arrived.
+                continue;
+            }
+
+            if !quiche::version_is_supported(quic_header.version) {
+                // invalid version, we need to negotiate version.
+                let neg_len = quiche::negotiate_version(&quic_header.scid, &quic_header.dcid, &mut buf)
+                    .expect("failed to create negotiate packet!");
+                sock_conn.send_to(&buf[..neg_len], src).await.unwrap();
+
+                continue;
+            }
+
+            let quic_conn = match quiche::accept(&quic_header.scid, None, &mut quic_conf) {
+                Ok (v) => v,
+                Err(_) => continue
+            };
+
+            
+            let (strm_sink, strm_strm) = channel::<(QuicSendStream, QuicRecvStream)>(128);
+            let (recv_sink, recv_strm) = channel::<IoRecvOps>(128);
+            let (send_sink, send_strm) = channel::<IoSendOps>(128);
+
+            table.insert(quic_header.dcid.clone(), recv_sink);
+            conn_tx.send(QuicConn {incoming: strm_strm, tx: send_sink.clone() }).await;
+
+            let internal = QuicServerInternal {
+                send_closed: false,
+                recv_closed: false,
+        
+                // initialize conenctions.
+                quic_conn : quic_conn, 
+                sock_conn : sock_conn.clone(),
+        
+                // initialize stream helpers.
+                strm_sink,
+                strm_table: HashMap::new(),
+
+                recv_strm : recv_strm,
+        
+                // initialize sender channels.
+                send_sink : send_sink.clone(),
+                send_strm : send_strm.clone(),
+            };
+
+            // start dispatching.
+            let handle = task::spawn(dispatch_server_connection(internal));
+            task::spawn(wait_and_remove(client_table.clone(), quic_header.dcid.clone(), handle));
+        }
+
+        let tx = table.get_mut(&quic_header.dcid).unwrap();
+        tx.send(IoRecvOps::IoRecv(buf[..len].to_vec().clone())).await;
+    }
+}
+
+pub async fn establish_server(bind_addr: SocketAddr, conf: ServerConfig) -> Result<QuicServer, anyhow::Error> {
+    let mut quic_conf = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    
+    quic_conf.set_initial_max_data(conf.pl_init_max_sz as u64);
+    quic_conf.set_initial_max_stream_data_bidi_local(conf.pl_init_max_bidi_sz as u64);
+    quic_conf.set_initial_max_stream_data_bidi_remote(conf.pl_init_max_bidi_sz as u64);
+    quic_conf.set_initial_max_streams_bidi(conf.pl_max_bidi_streams as u64);
+    quic_conf.set_initial_max_stream_data_uni(conf.pl_init_max_uni_sz as u64);
+    quic_conf.set_max_idle_timeout(conf.conn_timeout as u64);
+    quic_conf.set_max_packet_size(conf.conn_max_udp_size as u64);
+    quic_conf.set_disable_active_migration(true);
+    quic_conf.set_application_protos(&conf.conn_alpn).unwrap();
+    // quic_conf.load_cert_chain_from_pem_file("assets/client.pem").unwrap();
+
+    let (tx, rx) = channel::<QuicConn>(4);
+    task::spawn(dispatch_server_packets(tx, Arc::new(net::UdpSocket::bind(bind_addr).await?), quic_conf));
+
+    return Ok(QuicServer { rx });
 }
