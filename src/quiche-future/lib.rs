@@ -460,11 +460,10 @@ async fn dispatch_client_connection(mut internal: QuicClientInternal) {
 
         if internal_rx.len() % 2 == 0 {
             while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
-                internal.sock_conn.send(&send_buf[0..sz]).await
-                    .expect("fatal error! failed to write buffer on socket!");
+                if internal.sock_conn.send(&send_buf[0..sz]).await.is_err() {
+                    break;
+                }
             }
-
-            return;
         }
 
         if let Some(time) = internal.quic_conn.timeout() {
@@ -472,8 +471,8 @@ async fn dispatch_client_connection(mut internal: QuicClientInternal) {
         }
     };
 
-    h1.await;
-    h2.await;
+    h1.cancel().await;
+    h2.cancel().await;
 }
 
 pub async fn establish_client(bind_addr: SocketAddr, conn_addr: SocketAddr, conf: ClientConfig) -> Result<QuicConn, anyhow::Error> {
@@ -667,7 +666,6 @@ async fn process_server_timeout(internal: &mut QuicServerInternal) {
     internal.quic_conn.on_timeout();
 }
 
-
 async fn dispatch_server_send(tx: Sender<InternalIoOps>, strm: IoSendStream) {
     while let Ok(op) = strm.recv().await {
         tx.send(InternalIoOps::IoSend(op)).await;
@@ -701,11 +699,10 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
 
         if internal_rx.len() % 2 == 0 {
             while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
-                internal.sock_conn.send(&send_buf[0..sz]).await
-                    .expect("fatal error! failed to write buffer on socket!");
+                if internal.sock_conn.send(&send_buf[0..sz]).await.is_err() {
+                    break;
+                }
             }
-
-            return;
         }
 
         if let Some(time) = internal.quic_conn.timeout() {
@@ -713,8 +710,8 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
         }
     };
 
-    h1.await;
-    h2.await;
+    h1.cancel().await;
+    h2.cancel().await;
 }
 
 async fn wait_and_remove(table: Arc<Mutex<HashMap<Vec<u8>, IoRecvSink>>>, id: Vec<u8>, handle: JoinHandle<()>) {
