@@ -251,7 +251,7 @@ impl QuicConn {
     }
     
     pub async fn create_stream(&mut self, strm_id: u64) -> (QuicSendStream, QuicRecvStream) {
-        let (rx_sink, rx_strm) = channel::<IoRecvOps>(128);
+        let (rx_sink, rx_strm) = channel::<IoRecvOps>(4);
         self.tx.send(IoSendOps::IoStreamOpen(strm_id, rx_sink)).await;
 
         log::info!("established a new stream (stream_id = {}, create)", strm_id);
@@ -365,7 +365,7 @@ async fn process_client_recv(internal: &mut QuicClientInternal, req: IoRecvOps) 
     let strm_id_iter = internal.quic_conn.readable();
     for strm_id in strm_id_iter {
         if !internal.strm_table.contains_key(&strm_id) {
-            let (rx_sink, rx_strm) = channel::<IoRecvOps>(128);
+            let (rx_sink, rx_strm) = channel::<IoRecvOps>(4);
 
             let send_stream = QuicSendStream {
                 stream_id: strm_id,
@@ -440,7 +440,7 @@ async fn dispatch_client_timeout(tx: Sender<InternalIoOps>, time: Duration) {
 }
 
 async fn dispatch_client_connection(mut internal: QuicClientInternal) {
-    let (internal_tx, internal_rx) = channel::<InternalIoOps>(128);
+    let (internal_tx, internal_rx) = channel::<InternalIoOps>(4);
 
     let h1 = task::spawn(dispatch_client_send(internal_tx.clone(), internal.send_strm.clone()));
     let h2 = task::spawn(dispatch_client_recv(internal_tx.clone(), internal.sock_conn.clone()));
@@ -453,10 +453,6 @@ async fn dispatch_client_connection(mut internal: QuicClientInternal) {
             InternalIoOps::IoSend(send_op) => process_client_send(&mut internal, send_op).await,
             InternalIoOps::IoRecv(recv_op) => process_client_recv(&mut internal, recv_op).await,
         };
-        
-        if internal.quic_conn.is_closed() {
-            break;
-        }
 
         if internal_rx.len() % 2 == 0 {
             while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
@@ -468,6 +464,11 @@ async fn dispatch_client_connection(mut internal: QuicClientInternal) {
 
         if let Some(time) = internal.quic_conn.timeout() {
             task::spawn(dispatch_client_timeout(internal_tx.clone(), time));
+        }
+
+        if internal.quic_conn.is_closed() {
+            log::info!("quic connection closed! = {:?}", &internal.quic_conn.trace_id());
+            break;
         }
     };
 
@@ -489,8 +490,8 @@ pub async fn establish_client(bind_addr: SocketAddr, conn_addr: SocketAddr, conf
     quic_conf.set_application_protos(&conf.conn_alpn).unwrap();
     quic_conf.load_cert_chain_from_pem_file("assets/client.pem").unwrap();
 
-    let (strm_sink, strm_strm) = channel::<(QuicSendStream, QuicRecvStream)>(128);
-    let (send_sink, send_strm) = channel::<IoSendOps>(128);
+    let (strm_sink, strm_strm) = channel::<(QuicSendStream, QuicRecvStream)>(4);
+    let (send_sink, send_strm) = channel::<IoSendOps>(4);
 
     let socket = net::UdpSocket::bind(bind_addr).await?;
     socket.connect(conn_addr).await?;
@@ -544,6 +545,7 @@ struct QuicServerInternal {
 
     quic_conn: Pin<Box<quiche::Connection>>,
     sock_conn: Arc<net::UdpSocket>, 
+    sock_addr: SocketAddr,
 
     strm_sink: Sender<(QuicSendStream, QuicRecvStream)>,
     strm_table: HashMap<u64, IoRecvSink>,
@@ -622,7 +624,7 @@ async fn process_server_recv(internal: &mut QuicServerInternal, req: IoRecvOps) 
     let strm_id_iter = internal.quic_conn.readable();
     for strm_id in strm_id_iter {
         if !internal.strm_table.contains_key(&strm_id) {
-            let (rx_sink, rx_strm) = channel::<IoRecvOps>(128);
+            let (rx_sink, rx_strm) = channel::<IoRecvOps>(4);
 
             let send_stream = QuicSendStream {
                 stream_id: strm_id,
@@ -679,7 +681,7 @@ async fn dispatch_server_recv(tx: Sender<InternalIoOps>, strm: IoRecvStream) {
 }
 
 async fn dispatch_server_connection(mut internal: QuicServerInternal) {
-    let (internal_tx, internal_rx) = channel::<InternalIoOps>(128);
+    let (internal_tx, internal_rx) = channel::<InternalIoOps>(4);
 
     let h1 = task::spawn(dispatch_server_send(internal_tx.clone(), internal.send_strm.clone()));
     let h2 = task::spawn(dispatch_server_recv(internal_tx.clone(), internal.recv_strm.clone()));
@@ -692,14 +694,11 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
             InternalIoOps::IoSend(send_op) => process_server_send(&mut internal, send_op).await,
             InternalIoOps::IoRecv(recv_op) => process_server_recv(&mut internal, recv_op).await,
         };
-        
-        if internal.quic_conn.is_closed() {
-            break;
-        }
 
         if internal_rx.len() % 2 == 0 {
             while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
-                if internal.sock_conn.send(&send_buf[0..sz]).await.is_err() {
+                if internal.sock_conn.send_to(&send_buf[0..sz], &internal.sock_addr).await.is_err() {
+                    log::error!("failed to send packe to = {:?}", &internal.sock_addr);
                     break;
                 }
             }
@@ -707,6 +706,11 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
 
         if let Some(time) = internal.quic_conn.timeout() {
             task::spawn(dispatch_client_timeout(internal_tx.clone(), time));
+        }
+
+        if internal.quic_conn.is_closed() {
+            log::info!("quic connection closed! = {:?}", &internal.quic_conn.trace_id());
+            break;
         }
     };
 
@@ -758,11 +762,10 @@ pub async fn dispatch_server_packets(conn_tx: Sender<QuicConn>, sock_conn: Arc<n
                 Ok (v) => v,
                 Err(_) => continue
             };
-
             
-            let (strm_sink, strm_strm) = channel::<(QuicSendStream, QuicRecvStream)>(128);
-            let (recv_sink, recv_strm) = channel::<IoRecvOps>(128);
-            let (send_sink, send_strm) = channel::<IoSendOps>(128);
+            let (strm_sink, strm_strm) = channel::<(QuicSendStream, QuicRecvStream)>(4);
+            let (recv_sink, recv_strm) = channel::<IoRecvOps>(4);
+            let (send_sink, send_strm) = channel::<IoSendOps>(4);
 
             table.insert(quic_header.dcid.clone(), recv_sink);
             conn_tx.send(QuicConn {incoming: strm_strm, tx: send_sink.clone() }).await;
@@ -774,6 +777,7 @@ pub async fn dispatch_server_packets(conn_tx: Sender<QuicConn>, sock_conn: Arc<n
                 // initialize conenctions.
                 quic_conn : quic_conn, 
                 sock_conn : sock_conn.clone(),
+                sock_addr : src.clone(),
         
                 // initialize stream helpers.
                 strm_sink,
