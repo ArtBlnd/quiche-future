@@ -17,14 +17,13 @@ use futures::FutureExt;
 
 use anyhow;
 use quiche;
-use log;
 
 #[derive(Default)]
 pub struct ClientConfig {
     // SSL configurations.
     pub ssl_verify: bool,
     pub ssl_sni: Option<String>,
-    pub ssl_ca_cert: Vec<u8>,
+    pub ssl_ca_cert: String,
 
     // Payload configurations.
     pub pl_init_max_sz: usize,
@@ -43,8 +42,8 @@ pub struct ClientConfig {
 #[derive(Default)]
 pub struct ServerConfig {
     // SSL configurations.
-    pub ssl_key: Vec<u8>,
-    pub ssl_cert: Vec<u8>,
+    pub ssl_key_path: String,
+    pub ssl_cert_path: String,
 
     // Payload configurations.
     pub pl_init_max_sz: usize,
@@ -100,25 +99,6 @@ impl QuicRecvStream {
     }
 }
 
-unsafe impl Sync for QuicSendStream { }
-unsafe impl Send for QuicSendStream { }
-
-pub struct QuicSendStream {
-    stream_id: u64,
-
-    send_close: bool,
-    send_flush: bool,
-
-    tx_pending: std::sync::Mutex<HashSet<usize>>,
-    tx: IoSendSink,
-}
-
-impl QuicSendStream {
-    pub fn stream_id(&self) -> u64 {
-        self.stream_id
-    }
-}
-
 impl Read for QuicRecvStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context, wbuf: &mut [u8]) -> Poll<Result<usize, Error>> {
         let self_mut = self.get_mut();
@@ -161,6 +141,25 @@ impl Read for QuicRecvStream {
     }
 }
 
+unsafe impl Sync for QuicSendStream { }
+unsafe impl Send for QuicSendStream { }
+
+pub struct QuicSendStream {
+    stream_id: u64,
+
+    send_close: bool,
+    send_flush: bool,
+
+    tx_pending: std::sync::Mutex<HashSet<usize>>,
+    tx: IoSendSink,
+}
+
+impl QuicSendStream {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+}
+
 impl Write for QuicSendStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, rbuf: &[u8]) -> Poll<Result<usize, Error>> {
         let self_mut = self.get_mut();
@@ -183,7 +182,7 @@ impl Write for QuicSendStream {
 
         task::block_on(async {
             let mut buf = Vec::new();
-            buf.extend_from_slice(&rbuf);
+            buf.extend_from_slice(&rbuf); 
 
             self_mut.tx.send(IoSendOps::IoSend(self_mut.stream_id, buf, cx.waker().clone())).await;
         });
@@ -223,6 +222,20 @@ impl Write for QuicSendStream {
     }
 }
 
+impl Clone for QuicSendStream { 
+    fn clone(&self) -> Self {
+        QuicSendStream { 
+            stream_id: self.stream_id,
+
+            send_close: false,
+            send_flush: false,
+
+            tx_pending: Default::default(),
+            tx: self.tx.clone()
+        }
+    }
+}
+
 pub struct QuicConn {
     incoming: Receiver<(QuicSendStream, QuicRecvStream)>,
     tx: IoSendSink
@@ -243,18 +256,21 @@ struct QuicClientInternal {
 }
 
 impl QuicConn {
-    pub async fn listen_stream(&mut self) -> (QuicSendStream, QuicRecvStream) {
-        let (send_stream, recv_stream) = self.incoming.recv().await.unwrap();
-        log::info!("established a new stream (stream_id = {}, listen)", send_stream.stream_id());
+    pub async fn listen_stream(&mut self) -> Option<(QuicSendStream, QuicRecvStream)> {
+        let (send_stream, recv_stream) = match self.incoming.recv().await {
+            Ok (v) => v,
+            Err(_) => return None
+        };
 
-        return (send_stream, recv_stream);
+        log::info!("created a new stream (stream_id = {}, listen)", send_stream.stream_id());
+        return Some((send_stream, recv_stream));
     }
     
     pub async fn create_stream(&mut self, strm_id: u64) -> (QuicSendStream, QuicRecvStream) {
         let (rx_sink, rx_strm) = channel::<IoRecvOps>(4);
         self.tx.send(IoSendOps::IoStreamOpen(strm_id, rx_sink)).await;
 
-        log::info!("established a new stream (stream_id = {}, create)", strm_id);
+        log::info!("created a new stream (stream_id = {}, create)", strm_id);
         let send_stream = QuicSendStream {
             stream_id: strm_id,
             send_close: false,
@@ -308,7 +324,7 @@ async fn process_client_send(internal: &mut QuicClientInternal, req: IoSendOps) 
 
         IoSendOps::IoClose() => {
             if let Err(_) = internal.quic_conn.close(true, 0, b"") {
-                log::warn!("closing connection that is already closed!");
+                log::error!("[+] quic-trace | closed connection twice!");
             }
 
             internal.send_closed = true;
@@ -328,9 +344,11 @@ async fn process_client_send(internal: &mut QuicClientInternal, req: IoSendOps) 
                 // should not be opend!
             }
 
-            internal.strm_table.insert(strm_id, sink);
+            if internal.quic_conn.stream_send(strm_id, b"", false).is_ok() {
+                log::info!("[+] stream-trace | stream opened id = {}", strm_id);
+                internal.strm_table.insert(strm_id, sink);
+            }
 
-            log::info!("id = {} : stream opened", strm_id);
             return;
         }
 
@@ -338,7 +356,7 @@ async fn process_client_send(internal: &mut QuicClientInternal, req: IoSendOps) 
             wk = waker;
             internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
 
-            log::info!("id = {} : stream closed", strm_id);
+            log::info!("[+] stream-trace | stream closed id = {} type = write", strm_id);
         }
     }
 
@@ -346,9 +364,14 @@ async fn process_client_send(internal: &mut QuicClientInternal, req: IoSendOps) 
 }
 
 async fn process_client_recv(internal: &mut QuicClientInternal, req: IoRecvOps) {
+    
     match req {
-        IoRecvOps::IoRecv(mut buf) => { internal.quic_conn.recv(&mut buf).unwrap(); },
+        IoRecvOps::IoRecv(mut buf) => {
+            log::trace!("[+] socket-recv | len = {}", buf.len());
+            internal.quic_conn.recv(&mut buf).unwrap();
+        },
         IoRecvOps::IoEof() => {
+            log::trace!("[+] socket-recv | EOF reached!");
             for (_, sender) in &internal.strm_table {
                 sender.send(IoRecvOps::IoEof()).await;
             }
@@ -358,7 +381,7 @@ async fn process_client_recv(internal: &mut QuicClientInternal, req: IoRecvOps) 
         }
     }
 
-    assert!(internal.recv_closed, "socket is already closed with EOF!");
+    assert!(internal.recv_closed == false, "socket is already closed with EOF!");
 
     let mut tmp_buf = [0u8; 4096];
 
@@ -401,6 +424,8 @@ async fn process_client_recv(internal: &mut QuicClientInternal, req: IoRecvOps) 
         if is_fin {
             sink.send(IoRecvOps::IoEof()).await;
             internal.strm_table.remove(&strm_id);
+
+            log::info!("[+] stream-trace | stream closed id = {} type = read", strm_id);
         }
     }
 }
@@ -467,7 +492,7 @@ async fn dispatch_client_connection(mut internal: QuicClientInternal) {
         }
 
         if internal.quic_conn.is_closed() {
-            log::info!("quic connection closed! = {:?}", &internal.quic_conn.trace_id());
+            log::info!("[+] quic-trace | connection closed! = {}", &internal.quic_conn.trace_id());
             break;
         }
     };
@@ -487,8 +512,8 @@ pub async fn establish_client(bind_addr: SocketAddr, conn_addr: SocketAddr, conf
     quic_conf.set_max_idle_timeout(conf.conn_timeout as u64);
     quic_conf.set_max_packet_size(conf.conn_max_udp_size as u64);
     quic_conf.set_disable_active_migration(true);
-    quic_conf.set_application_protos(&conf.conn_alpn).unwrap();
-    quic_conf.load_cert_chain_from_pem_file("assets/client.pem").unwrap();
+    quic_conf.set_application_protos(&conf.conn_alpn).expect("bad apln value!");
+    quic_conf.load_cert_chain_from_pem_file(&conf.ssl_ca_cert).expect("failed to load cert chain!");
 
     let (strm_sink, strm_strm) = channel::<(QuicSendStream, QuicRecvStream)>(4);
     let (send_sink, send_strm) = channel::<IoSendOps>(4);
@@ -514,9 +539,9 @@ pub async fn establish_client(bind_addr: SocketAddr, conn_addr: SocketAddr, conf
     };
 
     // do client handshake.
-    log::info!("connecting to addr = {}", conn_addr);
+    log::info!("[+] quic-trace | connecting to addr = {}", conn_addr);
     process_client_handshake(&mut internal).await?;
-    log::info!("established addr = {}", conn_addr);
+    log::info!("[+] quic-trace | established addr = {}", conn_addr);
 
     // spawn dispatcher and returns client.
     task::spawn(dispatch_client_connection(internal));
@@ -556,7 +581,6 @@ struct QuicServerInternal {
     send_strm: IoSendStream,
 }
 
-
 async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) {
     let wk;
 
@@ -567,7 +591,7 @@ async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) 
 
         IoSendOps::IoClose() => {
             if let Err(_) = internal.quic_conn.close(true, 0, b"") {
-                log::warn!("closing connection that is already closed!");
+                log::error!("[+] quic-trace | closed connection twice!");
             }
 
             internal.send_closed = true;
@@ -587,9 +611,11 @@ async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) 
                 // should not be opend!
             }
 
-            internal.strm_table.insert(strm_id, sink);
-
-            log::info!("id = {} : stream opened", strm_id);
+            if internal.quic_conn.stream_send(strm_id, b"", false).is_ok() {
+                log::info!("[+] stream-trace | stream opened id = {}", strm_id);
+                internal.strm_table.insert(strm_id, sink);
+            }
+            
             return;
         }
 
@@ -597,7 +623,7 @@ async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) 
             wk = waker;
             internal.quic_conn.stream_shutdown(strm_id, quiche::Shutdown::Write, 0).unwrap();
 
-            log::info!("id = {} : stream closed", strm_id);
+            log::info!("[+] stream-trace | stream closed id = {} type = write", strm_id);
         }
     }
 
@@ -606,8 +632,17 @@ async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) 
 
 async fn process_server_recv(internal: &mut QuicServerInternal, req: IoRecvOps) {
     match req {
-        IoRecvOps::IoRecv(mut buf) => { internal.quic_conn.recv(&mut buf).unwrap(); },
+        IoRecvOps::IoRecv(mut buf) => {
+            log::trace!("[+] socket-recv | len = {}", buf.len());
+            match internal.quic_conn.recv(&mut buf) {
+                Ok (_) => {},
+                Err(e) => {
+                    log::error!("[+] socket-recv | error while process packet! {}", e);
+                }
+            }
+        },
         IoRecvOps::IoEof() => {
+            log::trace!("[+] socket-recv | EOF reached!");
             for (_, sender) in &internal.strm_table {
                 sender.send(IoRecvOps::IoEof()).await;
             }
@@ -617,7 +652,7 @@ async fn process_server_recv(internal: &mut QuicServerInternal, req: IoRecvOps) 
         }
     }
 
-    assert!(internal.recv_closed, "socket is already closed with EOF!");
+    assert!(internal.recv_closed == false, "socket is already closed with EOF!");
 
     let mut tmp_buf = [0u8; 4096];
 
@@ -658,6 +693,7 @@ async fn process_server_recv(internal: &mut QuicServerInternal, req: IoRecvOps) 
 
         if wbuf.len() > 0 { sink.send(IoRecvOps::IoRecv(wbuf)).await; }
         if is_fin {
+            log::info!("[+] quic-trace | connection closed! = {}", &internal.quic_conn.trace_id());
             sink.send(IoRecvOps::IoEof()).await;
             internal.strm_table.remove(&strm_id);
         }
@@ -695,12 +731,10 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
             InternalIoOps::IoRecv(recv_op) => process_server_recv(&mut internal, recv_op).await,
         };
 
-        if internal_rx.len() % 2 == 0 {
-            while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
-                if internal.sock_conn.send_to(&send_buf[0..sz], &internal.sock_addr).await.is_err() {
-                    log::error!("failed to send packe to = {:?}", &internal.sock_addr);
-                    break;
-                }
+        while let Ok(sz) = internal.quic_conn.send(&mut send_buf) {
+            if internal.sock_conn.send_to(&send_buf[0..sz], &internal.sock_addr).await.is_err() {
+                log::error!("[+] socket-send | failed to send packe to = {:?}", &internal.sock_addr);
+                break;
             }
         }
 
@@ -709,7 +743,7 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
         }
 
         if internal.quic_conn.is_closed() {
-            log::info!("quic connection closed! = {:?}", &internal.quic_conn.trace_id());
+            log::info!("[+] quic-trace | connection closed! = {}", &internal.quic_conn.trace_id());
             break;
         }
     };
@@ -791,8 +825,14 @@ pub async fn dispatch_server_packets(conn_tx: Sender<QuicConn>, sock_conn: Arc<n
             };
 
             // start dispatching.
+            log::info!("[+] quic-trace | connection established! = {}", internal.quic_conn.trace_id());
             let handle = task::spawn(dispatch_server_connection(internal));
             task::spawn(wait_and_remove(client_table.clone(), quic_header.dcid.clone(), handle));
+        }
+
+        if quic_header.ty == quiche::Type::Initial {
+            // bad quic packet arrived.
+            continue;
         }
 
         let tx = table.get_mut(&quic_header.dcid).unwrap();
@@ -806,13 +846,15 @@ pub async fn establish_server(bind_addr: SocketAddr, conf: ServerConfig) -> Resu
     quic_conf.set_initial_max_data(conf.pl_init_max_sz as u64);
     quic_conf.set_initial_max_stream_data_bidi_local(conf.pl_init_max_bidi_sz as u64);
     quic_conf.set_initial_max_stream_data_bidi_remote(conf.pl_init_max_bidi_sz as u64);
-    quic_conf.set_initial_max_streams_bidi(conf.pl_max_bidi_streams as u64);
     quic_conf.set_initial_max_stream_data_uni(conf.pl_init_max_uni_sz as u64);
+    quic_conf.set_initial_max_streams_uni(conf.pl_max_uni_streams as u64);
+    quic_conf.set_initial_max_streams_bidi(conf.pl_max_bidi_streams as u64);
     quic_conf.set_max_idle_timeout(conf.conn_timeout as u64);
     quic_conf.set_max_packet_size(conf.conn_max_udp_size as u64);
+    quic_conf.set_application_protos(&conf.conn_alpn).expect("bad protos");
+    quic_conf.load_cert_chain_from_pem_file(&conf.ssl_cert_path).expect("bad certificate");
+    quic_conf.load_priv_key_from_pem_file(&conf.ssl_key_path).expect("bad keychain");
     quic_conf.set_disable_active_migration(true);
-    quic_conf.set_application_protos(&conf.conn_alpn).unwrap();
-    // quic_conf.load_cert_chain_from_pem_file("assets/client.pem").unwrap();
 
     let (tx, rx) = channel::<QuicConn>(4);
     task::spawn(dispatch_server_packets(tx, Arc::new(net::UdpSocket::bind(bind_addr).await?), quic_conf));

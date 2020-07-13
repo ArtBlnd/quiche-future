@@ -2,3 +2,6 @@
 
 **/.DS_Store
 Cargo.lock
+
+src/example-client
+src/example-server

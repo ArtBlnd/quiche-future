@@ -1,17 +1,17 @@
 [package]
-name = "quiche-future"
+name = "quiche-future-sys"
 version = "0.1.0"
 authors = ["Jun Ryoung Ju <junryoungju@gmail.com>"]
 edition = "2018"
 
 [lib]
-name = "quiche_future"
+name = "quiche_future_sys"
 path = "lib.rs"
 
 [dependencies]
-quiche = "0.4.0"
+log = "*"
+quiche-future = { path = "../quiche-future" }
 async-std = { version = "*", features = ["unstable"] }
 anyhow = "*"
 futures = "*"
-log = "*"
 ring = "*"
