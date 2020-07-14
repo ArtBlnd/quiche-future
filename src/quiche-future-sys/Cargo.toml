@@ -7,11 +7,11 @@ edition = "2018"
 [lib]
 name = "quiche_future_sys"
 path = "lib.rs"
+crate-type = ["staticlib"]
 
 [dependencies]
 log = "*"
 quiche-future = { path = "../quiche-future" }
 async-std = { version = "*", features = ["unstable"] }
-anyhow = "*"
 futures = "*"
-ring = "*"
+rand = "*"

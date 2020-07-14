@@ -14,3 +14,4 @@ anyhow = "*"
 futures = "*"
 log = "*"
 quiche-future = { path = "../quiche-future" }
+simplelog = "*"

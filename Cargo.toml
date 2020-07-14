@@ -3,4 +3,5 @@ members = [
     "src/example-client",
     "src/example-server",
     "src/quiche-future",
+    "src/quiche-future-sys",
 ]

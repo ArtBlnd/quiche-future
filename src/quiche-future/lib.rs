@@ -32,7 +32,7 @@ pub struct ClientConfig {
 
     // Connection configurations.
     pub conn_timeout: usize,
-    pub conn_max_udp_size: usize,
+    pub conn_max_packet_sz: usize,
     pub conn_scid: [u8; 20],
     pub conn_alpn: Vec<u8>
 }
@@ -246,7 +246,7 @@ struct QuicClientInternal {
 
     strm_sink: Sender<(QuicSendStream, QuicRecvStream)>,
     strm_table: HashMap<u64, IoRecvSink>,
-    strm_frags: HashMap<u64, (Vec<u8>, Waker)>,
+    strm_frags: HashMap<u64, Vec<IoSendOps>>,
 
     send_sink: IoSendSink,
     send_strm: IoSendStream,
@@ -326,9 +326,26 @@ async fn process_client_send(internal: &mut QuicClientInternal, req: IoSendOps) 
         }
 
         IoSendOps::IoSend(strm_id, buf, waker) => {
-            if let Ok(sz) = internal.quic_conn.stream_send(strm_id, &buf, false) {
-                if sz != buf.len() {
-                    internal.strm_frags.insert(strm_id, (buf[sz..].to_vec(), waker));
+            if let Some(list) = internal.strm_frags.get_mut(&strm_id) {
+                if !list.is_empty() {
+                    list.push(IoSendOps::IoSend(strm_id, buf, waker));
+                }
+
+                return;
+            }
+
+            if let Ok(v) = internal.quic_conn.stream_send(strm_id, &buf, false) {
+                if v < buf.len() {
+                    if let Some(list) = internal.strm_frags.get_mut(&strm_id) {
+                        list.push(IoSendOps::IoSend(strm_id, buf[v..].to_owned(), waker));
+                    }
+                    else {
+                        let mut list = Vec::new();
+                        list.push(IoSendOps::IoSend(strm_id, buf[v..].to_owned(), waker));
+
+                        internal.strm_frags.insert(strm_id, list);
+                    }
+                    
                     return;
                 }
             }
@@ -481,10 +498,18 @@ async fn dispatch_client_connection(mut internal: QuicClientInternal) {
             log::trace!("[+] socket | sent len = {}", sz);
         }
 
-        let writable_streams = internal.quic_conn.writable();
-        for strm_id in writable_streams {
-            if let Some((b, w)) = internal.strm_frags.remove(&strm_id) {
-                internal.send_sink.send(IoSendOps::IoSend(strm_id, b, w)).await;
+        if !internal.strm_frags.is_empty() {
+            let writable_streams = internal.quic_conn.writable();
+            for strm_id in writable_streams {
+                if let Some(ops) = internal.strm_frags.remove(&strm_id) {
+                    for op in ops {
+                        process_client_send(&mut internal, op).await;
+                    }
+                }
+
+                if internal.strm_frags.is_empty() {
+                    break;
+                }
             }
         }
 
@@ -511,7 +536,7 @@ pub async fn establish_client(bind_addr: SocketAddr, conn_addr: SocketAddr, conf
     quic_conf.set_initial_max_streams_bidi(conf.pl_max_bidi_streams as u64);
     quic_conf.set_initial_max_stream_data_uni(conf.pl_init_max_uni_sz as u64);
     quic_conf.set_max_idle_timeout(conf.conn_timeout as u64);
-    quic_conf.set_max_packet_size(conf.conn_max_udp_size as u64);
+    quic_conf.set_max_packet_size(conf.conn_max_packet_sz as u64);
     quic_conf.set_disable_active_migration(true);
     quic_conf.set_application_protos(&conf.conn_alpn).expect("bad apln value!");
     quic_conf.load_cert_chain_from_pem_file(&conf.ssl_ca_cert).expect("failed to load cert chain!");
@@ -576,7 +601,7 @@ struct QuicServerInternal {
 
     strm_sink: Sender<(QuicSendStream, QuicRecvStream)>,
     strm_table: HashMap<u64, IoRecvSink>, 
-    strm_frags: HashMap<u64, (Vec<u8>, Waker)>,
+    strm_frags: HashMap<u64, Vec<IoSendOps>>,
 
     recv_strm: IoRecvStream,
 
@@ -599,9 +624,26 @@ async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) 
         }
 
         IoSendOps::IoSend(strm_id, buf, waker) => {
-            if let Ok(sz) = internal.quic_conn.stream_send(strm_id, &buf, false) {
-                if sz != buf.len() {
-                    internal.strm_frags.insert(strm_id, (buf[sz..].to_vec(), waker));
+            if let Some(list) = internal.strm_frags.get_mut(&strm_id) {
+                if !list.is_empty() {
+                    list.push(IoSendOps::IoSend(strm_id, buf, waker));
+                }
+
+                return;
+            }
+
+            if let Ok(v) = internal.quic_conn.stream_send(strm_id, &buf, false) {
+                if v < buf.len() {
+                    if let Some(list) = internal.strm_frags.get_mut(&strm_id) {
+                        list.push(IoSendOps::IoSend(strm_id, buf[v..].to_owned(), waker));
+                    }
+                    else {
+                        let mut list = Vec::new();
+                        list.push(IoSendOps::IoSend(strm_id, buf[v..].to_owned(), waker));
+
+                        internal.strm_frags.insert(strm_id, list);
+                    }
+                    
                     return;
                 }
             }
@@ -746,10 +788,18 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
             log::trace!("[+] socket | sent len = {}", sz);
         }
 
-        let writable_streams = internal.quic_conn.writable();
-        for strm_id in writable_streams {
-            if let Some((b, w)) = internal.strm_frags.remove(&strm_id) {
-                internal.send_sink.send(IoSendOps::IoSend(strm_id, b, w)).await;
+        if !internal.strm_frags.is_empty() {
+            let writable_streams = internal.quic_conn.writable();
+            for strm_id in writable_streams {
+                if let Some(ops) = internal.strm_frags.remove(&strm_id) {
+                    for op in ops {
+                        process_server_send(&mut internal, op).await;
+                    }
+                }
+
+                if internal.strm_frags.is_empty() {
+                    break;
+                }
             }
         }
 
