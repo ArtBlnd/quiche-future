@@ -772,7 +772,13 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
     // start process requests.
     let mut buf = [0u8; 1460];
 
+    let mut timeout_handle: Option<JoinHandle<()>> = None;
+
     while let Ok(req_op) = internal_rx.recv().await {
+        if let Some(handle) = timeout_handle.take() {
+            handle.cancel().await;
+        }
+
         match req_op {
             InternalIoOps::IoTimeout() => process_server_timeout(&mut internal).await,
             InternalIoOps::IoSend(send_op) => process_server_send(&mut internal, send_op).await,
@@ -809,7 +815,7 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
         }
 
         if let Some(time) = internal.quic_conn.timeout() {
-            task::spawn(dispatch_client_timeout(internal_tx.clone(), time));
+            timeout_handle = Some(task::spawn(dispatch_client_timeout(internal_tx.clone(), time)));
         }
 
         if internal.quic_conn.is_closed() {
