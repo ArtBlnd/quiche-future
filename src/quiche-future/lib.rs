@@ -481,7 +481,7 @@ async fn dispatch_client_connection(mut internal: QuicClientInternal) {
     let h2 = task::spawn(dispatch_client_recv(internal_tx.clone(), internal.sock_conn.clone()));
 
     // start process requests.
-    let mut send_buf = [0u8; 1420];
+    let mut send_buf = [0u8; 1200];
     while let Ok(req_op) = internal_rx.recv().await {
         match req_op {
             InternalIoOps::IoTimeout() => process_client_timeout(&mut internal).await,
