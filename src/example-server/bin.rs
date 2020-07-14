@@ -161,7 +161,7 @@ fn main() {
         conf.pl_max_uni_streams  = 1000;
 
         conf.conn_timeout        = 1000000;
-        conf.conn_max_packet_sz  = 1024 * 10;
+        conf.conn_max_packet_sz  = 65527;
 
         conf.conn_alpn           = b"\x06fibers".to_vec();
         conf.ssl_cert_path       = "assets/server.pem".to_string();
