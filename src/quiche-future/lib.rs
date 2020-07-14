@@ -676,13 +676,13 @@ async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) 
 async fn process_server_recv(internal: &mut QuicServerInternal, req: IoRecvOps) {
     match req {
         IoRecvOps::IoRecv(mut buf) => {
-            match internal.quic_conn.recv(&mut buf) {
-                Ok (s) => {
-                    assert!(s != buf.len(), "bad recv buffer size!");
-                    log::trace!("[+] socket | parsed packet len = {}", buf.len());
-                },
-                Err(e) => {
-                    log::error!("[+] socket | error while process packet! {}", e);
+            let mut buf_idx = 0;
+            while let Ok(s) = internal.quic_conn.recv(&mut buf[buf_idx..]) {
+                log::trace!("[+] quic-trace | parsed packet len = {}", s);
+
+                buf_idx += s;
+                if buf_idx == buf.len() {
+                    break;
                 }
             }
         },
