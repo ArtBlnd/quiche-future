@@ -632,22 +632,21 @@ async fn process_server_send(internal: &mut QuicServerInternal, req: IoSendOps) 
                 return;
             }
 
-            if let Ok(v) = internal.quic_conn.stream_send(strm_id, &buf, false) {
-                if v < buf.len() {
-                    if let Some(list) = internal.strm_frags.get_mut(&strm_id) {
-                        list.push(IoSendOps::IoSend(strm_id, buf[v..].to_owned(), waker));
-                    }
-                    else {
-                        let mut list = Vec::new();
-                        list.push(IoSendOps::IoSend(strm_id, buf[v..].to_owned(), waker));
-
-                        internal.strm_frags.insert(strm_id, list);
-                    }
-                    
-                    return;
+            if (internal.quic_conn.stream_capacity(strm_id).unwrap() as usize) < buf.len() * 2 {
+                if let Some(list) = internal.strm_frags.get_mut(&strm_id) {
+                    list.push(IoSendOps::IoSend(strm_id, buf, waker));
                 }
+                else {
+                    let mut list = Vec::new();
+                    list.push(IoSendOps::IoSend(strm_id, buf, waker));
+
+                    internal.strm_frags.insert(strm_id, list);
+                }
+
+                return;
             }
 
+            internal.quic_conn.stream_send(strm_id, &buf, false);
             waker.wake();
         }
 
@@ -800,16 +799,18 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
         }
 
         if !internal.strm_frags.is_empty() {
-            let writable_streams = internal.quic_conn.writable();
-            for strm_id in writable_streams {
-                if let Some(ops) = internal.strm_frags.remove(&strm_id) {
-                    for op in ops {
-                        process_server_send(&mut internal, op).await;
-                    }
+            let mut writable = Vec::new();
+            for (strm_id, _) in internal.strm_frags.iter() {
+                if internal.quic_conn.stream_capacity(*strm_id).unwrap() > 65527 {
+                    writable.push(*strm_id);
                 }
+            }
 
-                if internal.strm_frags.is_empty() {
-                    break;
+            for writable_stream in writable {
+                let ops = internal.strm_frags.remove(&writable_stream).unwrap();
+                for op in ops {
+                    internal_tx.try_send(InternalIoOps::IoSend(op))
+                        .expect("failed to re-register send-ops");
                 }
             }
         }
