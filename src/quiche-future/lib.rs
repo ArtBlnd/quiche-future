@@ -771,7 +771,7 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
     let h2 = task::spawn(dispatch_server_recv(internal_tx.clone(), internal.recv_strm.clone()));
 
     // start process requests.
-    let mut buf = [0u8; 1460];
+    let mut buf = [0u8; 1200];
 
     while let Ok(req_op) = internal_rx.recv().await {
         match req_op {
