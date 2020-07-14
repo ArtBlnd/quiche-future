@@ -779,14 +779,17 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
             InternalIoOps::IoRecv(recv_op) => process_server_recv(&mut internal, recv_op).await,
         };
 
-        while let Ok(sz) = internal.quic_conn.send(&mut buf) {
-            if internal.sock_conn.send_to(&buf[..sz], &internal.sock_addr).await.is_err() {
-                log::error!("[+] socket-send | failed to send packet to = {:?}", &internal.sock_addr);
-                break;
-            }
-
-            log::trace!("[+] socket | sent len = {}", sz);
+        let mut buf_idx = 0;
+        while let Ok(sz) = internal.quic_conn.send(&mut buf[buf_idx..]) {
+            buf_idx += sz;
         }
+
+        if internal.sock_conn.send_to(&buf[..buf_idx], &internal.sock_addr).await.is_err() {
+            log::error!("[+] socket-send | failed to send packet to = {:?}", &internal.sock_addr);
+            break;
+        }
+
+        log::trace!("[+] socket | sent len = {}", buf_idx);
 
         if !internal.strm_frags.is_empty() {
             let writable_streams = internal.quic_conn.writable();
