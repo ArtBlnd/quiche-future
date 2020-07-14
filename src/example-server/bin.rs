@@ -148,7 +148,7 @@ async fn start_vpn_instance(send_stream: QuicSendStream, mut recv_stream: QuicRe
 }
 
 fn main() {
-    SimpleLogger::init(LevelFilter::Info, Config::default())
+    SimpleLogger::init(LevelFilter::Trace, Config::default())
         .expect("failed to init logger!");
 
     task::block_on(async {
