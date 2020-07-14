@@ -784,12 +784,14 @@ async fn dispatch_server_connection(mut internal: QuicServerInternal) {
             buf_idx += sz;
         }
 
-        if internal.sock_conn.send_to(&buf[..buf_idx], &internal.sock_addr).await.is_err() {
-            log::error!("[+] socket-send | failed to send packet to = {:?}", &internal.sock_addr);
-            break;
+        if buf_idx != 0 {
+            if internal.sock_conn.send_to(&buf[..buf_idx], &internal.sock_addr).await.is_err() {
+                log::error!("[+] socket-send | failed to send packet to = {:?}", &internal.sock_addr);
+                break;
+            }
+    
+            log::trace!("[+] socket | sent len = {}", buf_idx);
         }
-
-        log::trace!("[+] socket | sent len = {}", buf_idx);
 
         if !internal.strm_frags.is_empty() {
             let writable_streams = internal.quic_conn.writable();
