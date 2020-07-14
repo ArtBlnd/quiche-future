@@ -12,6 +12,6 @@ path = "bin.rs"
 async-std = { version = "*", features = ["unstable"] }
 anyhow = "*"
 futures = "*"
-log = "*"
+log = { version = "*", features = ["release_max_level_warn"] }
 quiche-future = { path = "../quiche-future" }
 simplelog = "*"
